@@ -1,0 +1,13 @@
+# Keep the build context small and make it impossible to bake secrets into a layer.
+.env
+certs/
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+scripts/
+data/
+!data/raw/stada/poll_targets.json

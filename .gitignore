@@ -1,0 +1,19 @@
+# Secrets and local environment
+.env
+certs/
+
+# Source and generated data — never in git
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+
+# NOTE: uv.lock IS committed. This is an application, not a library:
+# the lockfile is what makes local, CI and Docker byte-identical.

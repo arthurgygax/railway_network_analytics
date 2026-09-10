@@ -1,0 +1,44 @@
+[project]
+name = "railway-network-analytics"
+version = "0.1.0"
+description = "Ingestion and analytics for German railway GTFS / GTFS-RT data"
+readme = "README.md"
+authors = [
+    { name = "Blackangoo", email = "blackangoo.gc@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "kafka-python>=3.0.11",
+]
+
+[project.scripts]
+railway-ingest = "railway_network_analytics.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.14",
+    # Only for scripts/profile_gtfs_rt.py, the archived Phase 0 analysis of the
+    # retired GTFS.de source. Not needed by the application or the container.
+    "gtfs-realtime-bindings>=2.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# One-off Phase 0 report generator: the long lines ARE the report text.
+"scripts/profile_gtfs_rt.py" = ["E501", "E731", "F541"]
+# One-off investigation tools: readable output beats a 100-char limit.
+"scripts/pick_poll_targets.py" = ["E501"]
+"scripts/probe_timetables_join.py" = ["E501"]
