@@ -315,3 +315,24 @@ def test_scope_filter_can_be_disabled(tmp_path):
     source = make_source(tmp_path)
     source.only_fernverkehr = False
     assert len(source.poll().observations) == 3
+
+
+def test_third_party_operators_have_no_filter_flag_and_are_kept(tmp_path):
+    """Measured on live data: DB sets `f` only for its own and partner trains, so a
+    non-DB operator's <tl> carries a category but no flag. That bucket mixes private
+    regional (NX) with open-access long-distance (FLX), so we keep it and let Silver
+    classify — a category allowlist here would silently drop Flixtrain."""
+    plan = """<timetable>
+     <s id="1-2609101000-1"><tl t="p" o="FLX30" c="FLX" n="1322"/><dp pt="2609101010"/></s>
+     <s id="2-2609101000-1"><tl t="p" o="NXRE" c="NX" n="89723"/><dp pt="2609101020"/></s>
+     <s id="3-2609101000-1"><tl f="N" t="p" o="80" c="RE" n="1"/><dp pt="2609101030"/></s>
+    </timetable>"""
+    fchg = """<timetable>
+     <s id="1-2609101000-1"><dp ct="2609101015"/></s>
+     <s id="2-2609101000-1"><dp ct="2609101025"/></s>
+     <s id="3-2609101000-1"><dp ct="2609101035"/></s>
+    </timetable>"""
+    result = make_source(tmp_path, responses={"plan": plan, "fchg": fchg}).poll()
+    kept = {o.train_category for o in result.observations}
+    assert kept == {"FLX", "NX"}   # both unflagged: kept, noise and signal alike
+    assert "RE" not in kept        # positively flagged Nahverkehr: excluded

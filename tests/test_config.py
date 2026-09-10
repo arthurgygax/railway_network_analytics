@@ -101,7 +101,7 @@ def test_kafka_sink_accepts_full_credentials(poll_targets, tmp_path):
         KAFKA_USERNAME="avnadmin", KAFKA_PASSWORD="hunter2", KAFKA_CA_CERT=str(ca),
     ))
     assert config.sink == "kafka"
-    assert config.kafka_topic == "railway.gtfs.trip_updates"
+    assert config.kafka_topic == "railway.db.stop_observations"
 
 
 def test_kafka_sink_rejects_missing_ca_cert(poll_targets, tmp_path):

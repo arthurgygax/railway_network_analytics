@@ -58,3 +58,14 @@ def configure_logging(level: str, fmt: str) -> None:
     root.handlers.clear()  # idempotent: safe to call twice (tests, reloads)
     root.addHandler(handler)
     root.setLevel(level)
+
+    # kafka-python emits ~40 INFO lines per connection lifecycle (bootstrap, SASL,
+    # coordinator discovery, group join), which buries the application's own output.
+    # Silence it unless the operator explicitly asked for DEBUG, in which case they
+    # presumably want the connection detail too.
+    # Set it both ways, not just one: this function is documented as safe to call
+    # twice, so a later DEBUG call must be able to un-silence what an earlier INFO
+    # call silenced.
+    logging.getLogger("kafka").setLevel(
+        logging.NOTSET if level.upper() == "DEBUG" else logging.WARNING
+    )

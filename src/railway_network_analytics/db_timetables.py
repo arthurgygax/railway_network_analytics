@@ -267,13 +267,22 @@ class DbTimetablesSource:
     targets: list[dict]
     cache: PlanCache
     clock: object = None  # callable returning an aware datetime; defaults to now()
-    # Project scope. `<tl f="F">` replaces the entire static-GTFS trip-id filter.
+    # Project scope. Excludes what is positively flagged as NOT long-distance
+    # (f=N Nahverkehr, f=S S-Bahn, f=D partner), and keeps everything else.
     #
-    # Excludes what we can positively identify as NOT long-distance (N/S/D), and keeps
-    # stops we could not identify at all. That asymmetry is deliberate: an unidentified
-    # stop is one whose plan hour fell outside our window, which skews towards trains
-    # that started long ago — the badly delayed ones. Keeping ~14% regional noise is a
-    # far cheaper mistake than silently dropping the worst delays.
+    # That asymmetry matters more than it looks, because `f` is missing in two very
+    # different situations and we cannot tell them apart here:
+    #
+    #   1. No plan match at all — the stop's plan hour fell outside our window. These
+    #      skew towards trains that started long ago, i.e. the badly delayed ones.
+    #   2. A non-DB operator. DB sets `f` only for its own and partner trains, so
+    #      third-party operators have no flag — and that bucket mixes private REGIONAL
+    #      (NX National Express, ARV, vlx) with open-access LONG-DISTANCE (FLX
+    #      Flixtrain, TRI). Measured on live data, both appear.
+    #
+    # So `f="F"` is a DB-centric filter, not a mode classifier. A category allowlist
+    # would be a classifier, but it would drop Flixtrain and rot as operators change.
+    # We over-collect deliberately and let Silver classify on category + operator.
     only_fernverkehr: bool = True
 
     def _now(self) -> datetime:

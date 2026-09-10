@@ -1,4 +1,6 @@
-"""Kafka output boundary. Implements the same ObservationSink protocol as JsonLinesSink."""
+"""Kafka output boundary. Implements the same ObservationSink protocol as JsonLinesSink,
+so swapping the destination touches nothing in `service.py`.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +16,8 @@ from .db_timetables import StopObservation
 
 log = logging.getLogger(__name__)
 
+SCHEMA_VERSION = "1"
+
 
 def build_producer(config: Config) -> KafkaProducer:
     return KafkaProducer(
@@ -22,8 +26,23 @@ def build_producer(config: Config) -> KafkaProducer:
         sasl_mechanism="SCRAM-SHA-256",
         sasl_plain_username=config.kafka_username,
         sasl_plain_password=config.kafka_password,
-        ssl_cafile=config.kafka_ca_cert,
+        ssl_cafile=str(config.kafka_ca_cert),
         client_id="railway-ingest",
+        # Durability. These match kafka-python 3.x defaults today, but are stated
+        # explicitly because a library upgrade must not silently change them.
+        #
+        # NOTE: acks="all" waits for all IN-SYNC replicas, and this cluster has
+        # min.insync.replicas=1 — so today it is no stronger than acks=1. Raising that
+        # to 2 would make it a real guarantee at the cost of halting writes whenever
+        # one of the two brokers is down.
+        acks="all",
+        enable_idempotence=True,
+        # Measured ~14x on our payloads: consecutive observations repeat the same JSON
+        # keys, so a batch compresses very well. gzip is the only codec available
+        # without an extra dependency.
+        compression_type="gzip",
+        # Our data is already up to an hour stale; 20ms of batching costs nothing real.
+        linger_ms=20,
     )
 
 
@@ -32,16 +51,23 @@ class KafkaSink:
     producer: KafkaProducer
     topic: str
 
-    def write(self, trips: Iterable[StopObservation]) -> int:
+    def write(self, observations: Iterable[StopObservation]) -> int:
         count = 0
-        for trip in trips:
+        for observation in observations:
             self.producer.send(
                 self.topic,
-                key=trip.key().encode("utf-8"),
-                value=json.dumps(trip.to_dict(), separators=(",", ":")).encode("utf-8"),
+                # stop_id = {trip_id}-{start_datetime}-{stop_index}: the natural key of
+                # the record, high cardinality, and one message per key — which keeps a
+                # compacted "latest state per stop" topic possible later.
+                key=observation.key().encode("utf-8"),
+                value=json.dumps(observation.to_dict(), separators=(",", ":")).encode("utf-8"),
+                # Cheap migration handle: a consumer can route or reject by version
+                # without the payload having to carry it.
+                headers=[("schema_version", SCHEMA_VERSION.encode("utf-8"))],
             )
             count += 1
-        # One flush per poll: send() only buffers. Until this returns, nothing is durable.
+        # One flush per cycle. send() only buffers — until this returns, nothing is
+        # durable. It does not surface per-record failures; see `write` in the README.
         self.producer.flush()
         return count
 

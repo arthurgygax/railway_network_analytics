@@ -1,0 +1,49 @@
+# Two processes, one image. Both must run for the whole collection period.
+#
+#   set -a; source .env; set +a; docker compose up -d --build
+#   docker compose logs -f
+#
+# Credentials come from .env via substitution — never baked into the image. Each
+# service is given only the variables it actually uses.
+
+services:
+  # DB APIs -> Kafka, hourly.
+  ingest:
+    build: .
+    image: railway-ingest:0.2
+    restart: unless-stopped
+    environment:
+      TIMETABLES_CLIENT_ID: ${TIMETABLES_CLIENT_ID}
+      TIMETABLES_API_KEY: ${TIMETABLES_API_KEY}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_USERNAME: ${KAFKA_USERNAME}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD}
+      SINK: kafka
+      LOG_FORMAT: json
+    volumes:
+      # Public CA, but gitignored, so it is mounted rather than baked in.
+      - ./certs/ca.pem:/app/certs/ca.pem:ro
+      # Plan cache + change-detection state. MUST persist: without it every restart
+      # refetches 18 plan hours per station and re-emits the whole feed once.
+      - rna-state:/app/data/state
+
+  # Kafka -> Unity Catalog volume. Stateless: Kafka holds this consumer's offsets
+  # server-side, so a restart resumes exactly where it left off with nothing on disk.
+  bridge:
+    build: .
+    image: railway-ingest:0.2
+    command: ["-m", "railway_network_analytics.bridge"]
+    restart: unless-stopped
+    depends_on: [ingest]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_USERNAME: ${KAFKA_USERNAME}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD}
+      DATABRICKS_HOST: ${DATABRICKS_HOST}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN}
+      LOG_FORMAT: json
+    volumes:
+      - ./certs/ca.pem:/app/certs/ca.pem:ro
+
+volumes:
+  rna-state:

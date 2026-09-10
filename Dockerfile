@@ -47,4 +47,9 @@ USER ingest
 
 # Exec form, no shell wrapper: PID 1 is python itself, so SIGTERM from `docker stop`
 # reaches the signal handler instead of being swallowed by /bin/sh.
-ENTRYPOINT ["python", "-m", "railway_network_analytics"]
+#
+# ENTRYPOINT is just `python` so the same image can run either process: the ingestion
+# service (default CMD) or the bridge (compose overrides `command`). They share a
+# package and dependencies, so a second image would be pure duplication.
+ENTRYPOINT ["python"]
+CMD ["-m", "railway_network_analytics"]

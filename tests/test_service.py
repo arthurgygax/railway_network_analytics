@@ -217,3 +217,21 @@ def test_sink_write_probe_leaves_no_residue(tmp_path):
     sink = JsonLinesSink(tmp_path / "out")
     sink.ensure_writable()
     assert list(Path(tmp_path / "out").iterdir()) == []
+
+
+def test_kafka_client_logging_is_silenced_unless_debug():
+    """kafka-python logs ~40 INFO lines per connection, burying the app's own output."""
+    import logging
+
+    from railway_network_analytics.logging_setup import configure_logging
+
+    root = logging.getLogger()
+    saved = (root.handlers[:], root.level, logging.getLogger("kafka").level)
+    try:
+        configure_logging("INFO", "text")
+        assert logging.getLogger("kafka").level == logging.WARNING
+        configure_logging("DEBUG", "text")
+        assert logging.getLogger("kafka").level != logging.WARNING
+    finally:
+        root.handlers[:], root.level = saved[0], saved[1]
+        logging.getLogger("kafka").setLevel(saved[2])

@@ -8,11 +8,13 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "databricks-sdk>=0.137.0",
     "kafka-python>=3.0.11",
 ]
 
 [project.scripts]
 railway-ingest = "railway_network_analytics.__main__:main"
+railway-bridge = "railway_network_analytics.bridge:main"
 
 [dependency-groups]
 dev = [
@@ -37,6 +39,8 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
+# Databricks notebooks: `spark`, `dbutils` and `display` are injected by the runtime.
+"databricks/**/*.py" = ["F821"]
 # One-off Phase 0 report generator: the long lines ARE the report text.
 "scripts/profile_gtfs_rt.py" = ["E501", "E731", "F541"]
 # One-off investigation tools: readable output beats a 100-char limit.

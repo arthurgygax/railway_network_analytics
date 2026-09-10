@@ -22,7 +22,7 @@ DEFAULTS = {
     "LOG_LEVEL": "INFO",
     "LOG_FORMAT": "text",
     "SINK": "jsonl",
-    "KAFKA_TOPIC": "railway.gtfs.trip_updates",
+    "KAFKA_TOPIC": "railway.db.stop_observations",
     "KAFKA_BOOTSTRAP_SERVERS": "",
     "KAFKA_USERNAME": "",
     "KAFKA_PASSWORD": "",
