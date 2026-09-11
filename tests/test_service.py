@@ -29,8 +29,12 @@ def observation(stop_id: str = "1-2609101000-3", **overrides) -> StopObservation
         train_category="ICE", train_number="575", train_operator="80", train_filter="F",
         planned_arrival="2609101114", changed_arrival="2609101120",
         planned_departure="2609101120", changed_departure=None,
-        planned_platform="7", changed_platform=None,
-        planned_path="Mannheim Hbf|Stuttgart Hbf", changed_path=None,
+        planned_arrival_platform="7", planned_departure_platform="7",
+        changed_arrival_platform=None, changed_departure_platform=None,
+        planned_path_from="Köln Hbf|Siegburg/Bonn",
+        planned_path_to="Mannheim Hbf|Stuttgart Hbf",
+        changed_path_from=None, changed_path_to=None,
+        arrival_status=None, departure_status=None, cancelled_at=None, brand="ICE 575",
         messages=(("d", "43", None),), observed_at="2026-09-10T12:00:00+02:00",
     )
     return StopObservation(**{**base, **overrides})

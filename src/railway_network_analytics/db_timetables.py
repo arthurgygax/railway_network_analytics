@@ -77,10 +77,25 @@ class StopObservation:
     changed_arrival: str | None
     planned_departure: str | None
     changed_departure: str | None
-    planned_platform: str | None
-    changed_platform: str | None
-    planned_path: str | None
-    changed_path: str | None
+    planned_arrival_platform: str | None
+    planned_departure_platform: str | None
+    changed_arrival_platform: str | None
+    changed_departure_platform: str | None
+    # ar.ppth is where the train CAME FROM, dp.ppth is where it is GOING. Collapsing
+    # them into one column gave it opposite meanings at different stops, which would
+    # corrupt any origin->destination route model built on it.
+    planned_path_from: str | None
+    planned_path_to: str | None
+    changed_path_from: str | None
+    changed_path_to: str | None
+    # "c" = cancelled, "a" = added. The ONLY cancellation signal this feed carries;
+    # without it, cancellation rate is not computable at all.
+    arrival_status: str | None
+    departure_status: str | None
+    cancelled_at: str | None
+    # Full brand ("ICE 2829"). Present in fchg where <tl> is absent, so it recovers
+    # identity for some stops that never match a plan hour.
+    brand: str | None
     messages: tuple[tuple[str | None, str | None, str | None], ...]
     observed_at: str
 
@@ -90,8 +105,11 @@ class StopObservation:
     def payload(self) -> tuple:
         """Everything except observed_at — what must differ for this to be new data."""
         return (
-            self.changed_arrival, self.changed_departure, self.changed_platform,
-            self.changed_path, self.messages,
+            self.changed_arrival, self.changed_departure,
+            self.changed_arrival_platform, self.changed_departure_platform,
+            self.changed_path_from, self.changed_path_to,
+            self.arrival_status, self.departure_status,
+            self.cancelled_at, self.messages,
         )
 
     def to_dict(self) -> dict:
@@ -172,8 +190,10 @@ def parse_plan_stop(stop: ET.Element) -> dict:
         "train_filter": _attr(tl, "f"),
         "planned_arrival": _attr(ar, "pt"),
         "planned_departure": _attr(dp, "pt"),
-        "planned_platform": _attr(ar, "pp") or _attr(dp, "pp"),
-        "planned_path": _attr(dp, "ppth") or _attr(ar, "ppth"),
+        "planned_arrival_platform": _attr(ar, "pp"),
+        "planned_departure_platform": _attr(dp, "pp"),
+        "planned_path_from": _attr(ar, "ppth"),
+        "planned_path_to": _attr(dp, "ppth"),
     }
 
 
@@ -182,8 +202,14 @@ def parse_change_stop(stop: ET.Element) -> dict:
     return {
         "changed_arrival": _attr(ar, "ct"),
         "changed_departure": _attr(dp, "ct"),
-        "changed_platform": _attr(ar, "cp") or _attr(dp, "cp"),
-        "changed_path": _attr(dp, "cpth") or _attr(ar, "cpth"),
+        "changed_arrival_platform": _attr(ar, "cp"),
+        "changed_departure_platform": _attr(dp, "cp"),
+        "changed_path_from": _attr(ar, "cpth"),
+        "changed_path_to": _attr(dp, "cpth"),
+        "arrival_status": _attr(ar, "cs"),
+        "departure_status": _attr(dp, "cs"),
+        "cancelled_at": _attr(ar, "clt") or _attr(dp, "clt"),
+        "brand": _attr(ar, "fb") or _attr(dp, "fb"),
         "messages": tuple(
             (m.get("t"), m.get("c"), m.get("cat")) for m in stop.iter("m")
         ),
@@ -304,6 +330,11 @@ class DbTimetablesSource:
             fetched, hits = self.cache.fill(self.client, eva, now)
             plan_requests += fetched
             plan_hits += hits
+            # Save per station, not once per cycle. A cycle takes ~20 minutes on a cold
+            # cache; saving only at the end means any restart in that window discards
+            # up to 1,000 rate-limited requests of work. Measured: it happened.
+            if fetched:
+                self.cache.save()
             try:
                 root = self.client.get(f"fchg/{eva}")
             except TimetablesUnavailable as exc:
@@ -358,7 +389,9 @@ class DbTimetablesSource:
             observed_at=observed_at,
             **{k: planned.get(k) for k in (
                 "train_category", "train_number", "train_operator", "train_filter",
-                "planned_arrival", "planned_departure", "planned_platform", "planned_path")},
+                "planned_arrival", "planned_departure",
+                "planned_arrival_platform", "planned_departure_platform",
+                "planned_path_from", "planned_path_to")},
             **parse_change_stop(stop),
         )
 

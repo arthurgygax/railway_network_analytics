@@ -107,8 +107,9 @@ def test_parse_plan_stop_extracts_train_identity():
     assert parsed["train_filter"] == "F"
     assert parsed["planned_arrival"] == "2609101359"
     assert parsed["planned_departure"] == "2609101402"
-    assert parsed["planned_platform"] == "Fern 5"
-    assert parsed["planned_path"].startswith("Frankfurt(Main)Hbf|")
+    assert parsed["planned_arrival_platform"] == "Fern 5"
+    assert parsed["planned_path_from"].startswith("Köln Hbf|")     # where it came from
+    assert parsed["planned_path_to"].startswith("Frankfurt(Main)Hbf|")  # where it goes
 
 
 def test_parse_plan_stop_tolerates_missing_arrival():
@@ -123,7 +124,7 @@ def test_parse_change_stop_extracts_changes_and_messages():
     parsed = parse_change_stop(stop)
     assert parsed["changed_arrival"] == "2609101407"
     assert parsed["changed_departure"] == "2609101409"
-    assert parsed["changed_platform"] == "9"
+    assert parsed["changed_arrival_platform"] == "9"
     assert ("d", "43", None) in parsed["messages"]
     assert ("h", None, "Störung") in parsed["messages"]
 
@@ -143,7 +144,7 @@ def test_changes_are_joined_to_the_plan(tmp_path):
     ice = observed[STOP_ID]
     assert (ice.train_category, ice.train_number) == ("ICE", "29")
     assert (ice.planned_arrival, ice.changed_arrival) == ("2609101359", "2609101407")
-    assert ice.changed_platform == "9"
+    assert ice.changed_arrival_platform == "9"
     assert ice.station_eva == 8070003
 
 
@@ -336,3 +337,64 @@ def test_third_party_operators_have_no_filter_flag_and_are_kept(tmp_path):
     kept = {o.train_category for o in result.observations}
     assert kept == {"FLX", "NX"}   # both unflagged: kept, noise and signal alike
     assert "RE" not in kept        # positively flagged Nahverkehr: excluded
+
+
+def test_cancellation_status_is_captured():
+    """cs="c" is the ONLY cancellation signal this feed carries. Dropping it makes
+    cancellation rate — a stated dashboard metric — impossible to compute at all."""
+    stop = ET.fromstring('<s id="1-2609101000-1">'
+                         '<ar cs="c" clt="2609101740"/><dp cs="c" clt="2609101740"/></s>')
+    parsed = parse_change_stop(stop)
+    assert parsed["arrival_status"] == "c"
+    assert parsed["departure_status"] == "c"
+    assert parsed["cancelled_at"] == "2609101740"
+
+
+def test_a_cancellation_appearing_counts_as_a_change(tmp_path):
+    """The most important change possible must not be suppressed by change detection."""
+    from railway_network_analytics.change_filter import digest
+
+    running = make_source(tmp_path).poll().observations[0]
+    cancelled = type(running)(**{**running.to_dict(), "arrival_status": "c"})
+    assert digest(running.payload()) != digest(cancelled.payload())
+
+
+def test_brand_recovers_identity_when_the_plan_is_missing(tmp_path):
+    """fb appears in fchg where <tl> does not, so it names some of the ~14% of stops
+    that never match a plan hour."""
+    fchg = ('<timetable><s id="-9-2609100500-3" eva="1">'
+            '<ar ct="2609101500" fb="ICE 2829"/></s></timetable>')
+    (obs,) = make_source(tmp_path, responses={"plan": EMPTY, "fchg": fchg}).poll().observations
+    assert obs.train_category is None   # no plan match
+    assert obs.brand == "ICE 2829"      # but we still know which train it was
+
+
+def test_arrival_and_departure_paths_are_kept_separate():
+    """ar.ppth is where the train came FROM; dp.ppth is where it is going TO. One
+    column for both would give it opposite meanings at different stops, corrupting any
+    origin->destination route model."""
+    stop = ET.fromstring(
+        '<s id="1-2609101000-1">'
+        '<ar ppth="Zürich HB|Basel SBB" pp="7"/>'
+        '<dp ppth="Freiburg|Karlsruhe|Mannheim" pp="8"/></s>')
+    parsed = parse_plan_stop(stop)
+    assert parsed["planned_path_from"] == "Zürich HB|Basel SBB"
+    assert parsed["planned_path_to"] == "Freiburg|Karlsruhe|Mannheim"
+    assert parsed["planned_arrival_platform"] == "7"
+    assert parsed["planned_departure_platform"] == "8"
+
+
+def test_plan_cache_is_saved_per_station_not_once_per_cycle(tmp_path):
+    """A cold cycle takes ~20 minutes of rate-limited requests. Saving only at the end
+    means a restart in that window discards all of it — which is exactly what happened
+    during setup, leaving the cache file empty after three rebuilds."""
+    cache_path = tmp_path / "plan_cache.json"
+    targets = [{"eva": 1, "name": "A"}, {"eva": 2, "name": "B"}]
+    source = make_source(tmp_path, targets=targets)
+    source.cache.path = cache_path
+
+    saves = []
+    original = source.cache.save
+    source.cache.save = lambda: (saves.append(len(source.cache.stops)), original())
+    source.poll()
+    assert len(saves) >= len(targets)   # at least one save per station, not just one
