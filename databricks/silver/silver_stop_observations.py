@@ -20,11 +20,14 @@ from pyspark.sql.functions import (
     concat,
     from_json,
     lit,
+    nullif,
     split,
     to_timestamp,
     to_utc_timestamp,
+    trim,
     when,
 )
+from pyspark.sql.functions import filter as array_filter
 from pyspark.sql.types import (
     ArrayType,
     IntegerType,
@@ -114,6 +117,18 @@ def delay_minutes(planned, changed):
     ).otherwise(((changed.cast("long") - planned.cast("long")) / 60).cast("int"))
 
 
+def _route(changed, planned):
+    """Pipe-delimited path -> array of station names, blanks removed.
+
+    nullif: coalesce treats "" as a VALUE, so an empty cpth would shadow a perfectly
+            good ppth. Measured: 191 rows had path_from = [""] because of this.
+    filter: split("", "|") returns [""], not []. Left in, that empty string becomes a
+            "station", producing routes like ["", "Fulda", ""].
+    """
+    joined = coalesce(nullif(changed, lit("")), nullif(planned, lit("")))
+    return array_filter(split(joined, r"\|"), lambda x: trim(x) != lit(""))
+
+
 # COMMAND ----------
 
 parsed = (
@@ -156,10 +171,15 @@ silver = (
     )
     # Routes as arrays, so "does this trip pass through X" is array_contains(...)
     # instead of a LIKE on a pipe-delimited string.
-    .withColumn("path_from", split(coalesce(col("changed_path_from"),
-                                            col("planned_path_from")), r"\|"))
-    .withColumn("path_to", split(coalesce(col("changed_path_to"),
-                                          col("planned_path_to")), r"\|"))
+    #
+    # Two traps, both measured on real data:
+    #   nullif  — coalesce treats "" as a VALUE, so an empty cpth would shadow a
+    #             perfectly good ppth. 191 rows had path_from = [""] because of this.
+    #   filter  — split("", "|") returns [""], not []. An empty string then becomes a
+    #             "station", producing routes like ["", "Fulda", ""] whose origin and
+    #             destination are both the empty string.
+    .withColumn("path_from", _route(col("changed_path_from"), col("planned_path_from")))
+    .withColumn("path_to", _route(col("changed_path_to"), col("planned_path_to")))
     .drop("planned_arrival", "changed_arrival", "planned_departure", "changed_departure",
           "start_datetime", "planned_path_from", "planned_path_to",
           "changed_path_from", "changed_path_to")
