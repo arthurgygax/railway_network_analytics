@@ -46,3 +46,6 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # One-off investigation tools: readable output beats a 100-char limit.
 "scripts/pick_poll_targets.py" = ["E501"]
 "scripts/probe_timetables_join.py" = ["E501"]
+
+[tool.databricks.environment]
+environment_version = '5'
