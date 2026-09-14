@@ -17,21 +17,6 @@
 # COMMAND ----------
 
 # DBTITLE 1,Setup
-from pyspark.sql.functions import (
-    array,
-    col,
-    concat,
-    count,
-    countDistinct,
-    element_at,
-    expr,
-    lag,
-    lit,
-    row_number,
-    sum as spark_sum,
-    when,
-)
-from pyspark.sql.window import Window
 
 CATALOG = "railway"
 SOURCE = f"{CATALOG}.silver.stop_observations"

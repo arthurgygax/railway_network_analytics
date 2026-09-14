@@ -78,9 +78,10 @@ def main() -> int:
     sink: ObservationSink
     if config.sink == "kafka":
         # Imported lazily so a jsonl-only run never needs the kafka package loaded.
-        from .kafka_sink import KafkaSink, build_producer
+        from .kafka_sink import KafkaSink
 
-        sink = KafkaSink(build_producer(config), config.kafka_topic)
+        # The sink builds its own producer per cycle — see KafkaSink's docstring.
+        sink = KafkaSink(config, config.kafka_topic)
         log.info("using kafka sink", extra={"topic": config.kafka_topic})
     else:
         jsonl = JsonLinesSink(config.output_dir)

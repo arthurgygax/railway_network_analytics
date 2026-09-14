@@ -45,6 +45,13 @@ PLAN_HOURS_FORWARD = 8
 
 RATE_LIMIT_SLEEP = 1.1  # 60 req/min -> stay just under one per second
 
+# If this many requests fail back-to-back, the upstream (or our network) is gone, not
+# flaky. Measured the hard way: during a 3-day outage the service kept calling all 60
+# stations, so every cycle burned ~1,140 timeouts and took 19 hours instead of 4
+# minutes. It never crashed, so `restart: unless-stopped` never rescued it — a process
+# that runs and achieves nothing is worse than one that dies.
+MAX_CONSECUTIVE_FAILURES = 15
+
 
 class TimetablesUnavailable(RuntimeError):
     """Upstream unreachable, rate-limited, or returned something unparseable."""
@@ -143,6 +150,10 @@ class TimetablesClient:
 
     client_id: str
     api_key: str
+    # 60s was hardcoded here. During a 3-day network outage every one of ~1,140
+    # requests per cycle waited the full timeout, stretching a 4-minute cycle to 19
+    # hours. The API normally answers in under 2s.
+    timeout_seconds: int = 20
     requests: int = field(default=0, init=False)
 
     def get(self, path: str) -> ET.Element:
@@ -151,7 +162,7 @@ class TimetablesClient:
             headers={"DB-Client-Id": self.client_id, "DB-Api-Key": self.api_key},
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
             raise TimetablesUnavailable(f"HTTP {exc.code} for {path}") from exc
@@ -258,9 +269,14 @@ class PlanCache:
         self.hours_fetched = {h for h in self.hours_fetched if h.split("/")[1][:6] >= cutoff}
         return len(stale)
 
-    def fill(self, client: TimetablesClient, eva: int, now: datetime) -> tuple[int, int]:
-        """Fetch any plan hours in the window we have not already cached."""
-        fetched = hits = 0
+    def fill(self, client: TimetablesClient, eva: int,
+             now: datetime) -> tuple[int, int, int]:
+        """Fetch any plan hours in the window we have not already cached.
+
+        Returns (fetched, cache_hits, failures) — the caller needs the failure count
+        to decide whether the upstream is gone.
+        """
+        fetched = hits = failures = 0
         for offset in range(-PLAN_HOURS_BACK, PLAN_HOURS_FORWARD + 1):
             when = now + timedelta(hours=offset)
             slot = f"{eva}/{when:%y%m%d%H}"
@@ -273,13 +289,14 @@ class PlanCache:
             try:
                 root = client.get(f"plan/{eva}/{when:%y%m%d}/{when:%H}")
             except TimetablesUnavailable as exc:
+                failures += 1
                 log.warning("plan fetch failed", extra={"eva": eva, "detail": str(exc)})
                 continue
             for stop in root.findall("s"):
                 self.stops[stop.get("id")] = parse_plan_stop(stop)
             self.hours_fetched.add(slot)
             fetched += 1
-        return fetched, hits
+        return fetched, hits, failures
 
 
 # --------------------------------------------------------------------- adapter
@@ -324,24 +341,39 @@ class DbTimetablesSource:
         observations: list[StopObservation] = []
         polled = failed = changed = identified = unidentified = 0
         plan_requests = plan_hits = 0
+        consecutive_failures = 0
+        aborted = False
 
         for target in self.targets:
             eva = target["eva"]
-            fetched, hits = self.cache.fill(self.client, eva, now)
+            fetched, hits, plan_failures = self.cache.fill(self.client, eva, now)
             plan_requests += fetched
             plan_hits += hits
+            # Accumulate plan failures but do NOT decide here: a station can have every
+            # plan hour fail while fchg — the request that actually matters — succeeds.
+            # Judging before that attempt would abort a cycle that was working.
+            consecutive_failures += plan_failures
             # Save per station, not once per cycle. A cycle takes ~20 minutes on a cold
             # cache; saving only at the end means any restart in that window discards
             # up to 1,000 rate-limited requests of work. Measured: it happened.
             if fetched:
                 self.cache.save()
+            root = None
             try:
                 root = self.client.get(f"fchg/{eva}")
             except TimetablesUnavailable as exc:
                 failed += 1
+                consecutive_failures += 1
                 log.warning("fchg fetch failed", extra={"eva": eva, "detail": str(exc)})
+            else:
+                polled += 1
+                consecutive_failures = 0   # anything working resets the budget
+
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                aborted = True
+                break
+            if root is None:
                 continue
-            polled += 1
             for stop in root.findall("s"):
                 changed += 1
                 observation = self._build(stop, target, observed_at)
@@ -354,6 +386,15 @@ class DbTimetablesSource:
                 if self.only_fernverkehr and observation.train_filter not in (None, "F"):
                     continue
                 observations.append(observation)
+
+        if aborted:
+            # Give up on this cycle rather than spend hours timing out. fchg carries a
+            # ~28h window, so the next cycle recovers everything we skipped.
+            log.error(
+                "cycle aborted: upstream appears unreachable",
+                extra={"consecutive_failures": consecutive_failures,
+                       "stations_polled": polled, "stations_remaining": len(self.targets) - polled},
+            )
 
         self.cache.save()
         return PollResult(

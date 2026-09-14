@@ -139,6 +139,13 @@ def main() -> None:
             continue
         eva, fern = chosen
         station = by_eva.get(eva, {})
+        # Coordinates for the dashboard map. An earlier version of this script carried
+        # them and the rewrite dropped them, leaving the map with nothing to plot.
+        coords = next(
+            ((e.get("geographicCoordinates") or {}).get("coordinates")
+             for e in station.get("evaNumbers", []) if e["number"] == eva),
+            None,
+        )
         note = "" if eva == canonical else f" (canonical {canonical} was empty)"
         print(f"   keep   {name:<34} eva={eva} route_calls={weight} probe_F={fern}{note}")
         targets.append({
@@ -149,6 +156,8 @@ def main() -> None:
             "category": station.get("category"),
             "federal_state": station.get("federalState"),
             "route_calls": weight,
+            "longitude": coords[0] if coords else None,
+            "latitude": coords[1] if coords else None,
         })
 
     OUT.parent.mkdir(parents=True, exist_ok=True)

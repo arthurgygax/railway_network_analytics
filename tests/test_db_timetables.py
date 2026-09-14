@@ -398,3 +398,53 @@ def test_plan_cache_is_saved_per_station_not_once_per_cycle(tmp_path):
     source.cache.save = lambda: (saves.append(len(source.cache.stops)), original())
     source.poll()
     assert len(saves) >= len(targets)   # at least one save per station, not just one
+
+
+def test_cycle_aborts_when_the_upstream_is_unreachable(tmp_path):
+    """The 3-day outage bug: the service never crashed, so restart:unless-stopped never
+    fired. It just kept calling all 60 stations, burning ~1,140 timeouts per cycle and
+    stretching a 4-minute cycle to 19 hours. Give up early instead."""
+    from railway_network_analytics.db_timetables import MAX_CONSECUTIVE_FAILURES
+
+    class DeadClient:
+        requests = 0
+
+        def get(self, path):
+            DeadClient.requests += 1
+            raise TimetablesUnavailable("cannot reach: timed out")
+
+    targets = [{"eva": i, "name": f"S{i}"} for i in range(60)]
+    source = DbTimetablesSource(
+        client=DeadClient(), targets=targets,
+        cache=PlanCache(tmp_path / "c.json"), clock=lambda: FIXED_NOW,
+    )
+    result = source.poll()
+    assert result.observations == []
+    # Without the breaker this would be 60 stations x 18 plan requests = 1080.
+    assert DeadClient.requests <= MAX_CONSECUTIVE_FAILURES + 5
+    assert result.stations_polled == 0
+
+
+def test_a_successful_station_resets_the_failure_counter(tmp_path):
+    """Intermittent failures must not accumulate into a false 'upstream is down'."""
+    from railway_network_analytics.db_timetables import MAX_CONSECUTIVE_FAILURES
+
+    calls = {"n": 0}
+
+    class FlakyClient:
+        def get(self, path):
+            calls["n"] += 1
+            # Fail most plan fetches, but let every fchg succeed.
+            if path.startswith("fchg/"):
+                return ET.fromstring(FCHG_XML)
+            raise TimetablesUnavailable("flaky")
+
+    targets = [{"eva": 8070003, "name": "A"} for _ in range(6)]
+    source = DbTimetablesSource(
+        client=FlakyClient(), targets=targets,
+        cache=PlanCache(tmp_path / "c.json"), clock=lambda: FIXED_NOW,
+    )
+    result = source.poll()
+    # Every station answered fchg, so the cycle must run to completion.
+    assert result.stations_polled == len(targets)
+    assert calls["n"] > MAX_CONSECUTIVE_FAILURES
