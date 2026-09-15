@@ -165,9 +165,16 @@ silver = (
     )
     # The only cancellation signal the feed carries. Either leg being cancelled means
     # this stop did not happen as planned.
+    #
+    # coalesce is load-bearing: Spark uses three-valued logic, so NULL == "c" is NULL
+    # and NULL | NULL is NULL — NOT false. Without this, is_cancelled was NULL for
+    # 104,349 of 106,917 rows, and any downstream `NOT is_cancelled` filter silently
+    # discarded 97.6% of the data. The feed only emits cs when something IS cancelled,
+    # so absent means not cancelled.
     .withColumn(
         "is_cancelled",
-        (col("arrival_status") == "c") | (col("departure_status") == "c"),
+        (coalesce(col("arrival_status"), lit("")) == "c")
+        | (coalesce(col("departure_status"), lit("")) == "c"),
     )
     # Routes as arrays, so "does this trip pass through X" is array_contains(...)
     # instead of a LIKE on a pipe-delimited string.

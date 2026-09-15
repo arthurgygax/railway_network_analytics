@@ -51,10 +51,15 @@ base AS (
     
     -- Rule 3: Full route with NULL-safe concatenation
     -- COALESCE path arrays to empty arrays so CONCAT never returns NULL
-    CONCAT(
-      COALESCE(path_from, ARRAY()), 
-      ARRAY(station_name), 
-      COALESCE(path_to, ARRAY())
+    -- COALESCE so a NULL path (origin/terminus stop) does not NULL the whole route,
+    -- and FILTER so an empty string never becomes a "station" -> ["", "Fulda", ""].
+    FILTER(
+      CONCAT(
+        COALESCE(path_from, ARRAY()),
+        ARRAY(station_name),
+        COALESCE(path_to, ARRAY())
+      ),
+      x -> x IS NOT NULL AND TRIM(x) <> ''
     ) AS full_route_raw,
     
     -- Timestamps
@@ -82,7 +87,9 @@ with_propagated_routes AS (
     -- Trip-level propagation: fill missing routes from the longest route in the same trip
     FIRST_VALUE(full_route_raw) OVER (
       PARTITION BY trip_id, start_at
-      ORDER BY SIZE(COALESCE(full_route_raw, ARRAY())) DESC
+      -- Rank by USABLE length: a 1-element route means "no route info", so it must
+      -- never outrank a real one. Ranking by raw size let stubs win.
+      ORDER BY CASE WHEN SIZE(full_route_raw) >= 2 THEN SIZE(full_route_raw) ELSE 0 END DESC
     ) AS full_route,
     
     -- Rule 4: train_filter is unreliable — use train_category for mode classification
@@ -100,8 +107,11 @@ SELECT
   station_name,
   stop_index,
   full_route,
-  ELEMENT_AT(full_route, 1) AS origin,
-  ELEMENT_AT(full_route, -1) AS destination,
+  -- A one-element route is "we have no route for this stop", not a journey from a
+  -- station to itself. Taking element 1 and -1 unconditionally produced 24,106 rows
+  -- of "München Hbf -> München Hbf".
+  CASE WHEN SIZE(full_route) >= 2 THEN ELEMENT_AT(full_route, 1) END AS origin,
+  CASE WHEN SIZE(full_route) >= 2 THEN ELEMENT_AT(full_route, -1) END AS destination,
   planned_arrival_at,
   changed_arrival_at,
   planned_departure_at,
@@ -335,3 +345,186 @@ print(f"  Rows: {daily_perf.count():,}")
 # MAGIC GROUP BY origin, destination
 # MAGIC ORDER BY trips DESC
 # MAGIC LIMIT 20
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Station dimension
+# MAGIC
+# MAGIC Coordinates for the map. Uploaded from the laptop by `scripts/upload_station_dim.py`
+# MAGIC into a **separate** volume — a dimension file under `landing` would be swept up by
+# MAGIC Bronze's file stream and land in `_corrupt_record`.
+# MAGIC
+# MAGIC 58 of 60 coordinates come from StaDa; the two Swiss stations are added by hand,
+# MAGIC because StaDa covers German stations only. `coordinate_source` records which.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE TABLE railway.gold.station AS
+SELECT station_eva, station_name, stada_name, latitude, longitude,
+       coordinate_source, category, federal_state, route_calls
+FROM json.`/Volumes/railway/raw/reference/stations.jsonl`
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # segment_performance — the map layer
+# MAGIC
+# MAGIC **Grain: one row per (from_station, to_station, hops).**
+# MAGIC
+# MAGIC `hops` is the gap in `stop_index` between two stops we OBSERVED. We only poll ~60
+# MAGIC stations, so `hops > 1` means the train called at stations in between that we never
+# MAGIC saw — ICE 106 runs Freiburg -> Karlsruhe skipping Baden-Baden, for example.
+# MAGIC
+# MAGIC **Filter the map to `hops = 1`** for genuine adjacent track sections. Do NOT divide a
+# MAGIC multi-hop delay across its sub-sections: we have no idea where in the gap it happened,
+# MAGIC and splitting it would invent precision the data does not contain.
+# MAGIC
+# MAGIC Cancelled stops are excluded from delay maths — a cancelled train has no arrival
+# MAGIC time, and counting it as 0 would make punctuality improve every time one is dropped.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE TABLE railway.gold.segment_performance AS
+WITH consecutive AS (
+  SELECT
+    LAG(station_name)          OVER w AS from_station,
+    station_name                       AS to_station,
+    LAG(station_eva)           OVER w AS from_eva,
+    station_eva                        AS to_eva,
+    stop_index - LAG(stop_index) OVER w AS hops,
+    arrival_delay_minutes - LAG(arrival_delay_minutes) OVER w AS delay_gained,
+    LAG(arrival_delay_minutes) OVER w AS delay_at_from,
+    arrival_delay_minutes              AS delay_at_to,
+    (UNIX_TIMESTAMP(planned_arrival_at)
+     - UNIX_TIMESTAMP(LAG(planned_departure_at) OVER w)) / 60 AS planned_minutes,
+    train_category, service_date,
+    COALESCE(is_cancelled, FALSE) OR COALESCE(LAG(is_cancelled) OVER w, FALSE)
+      AS either_cancelled
+  FROM railway.gold.route_station_performance
+  WHERE is_long_distance
+  WINDOW w AS (PARTITION BY trip_id, start_at ORDER BY stop_index)
+)
+SELECT
+  c.from_station, c.to_station, c.hops,
+  COUNT(*)                                             AS trips,
+  ROUND(AVG(c.delay_gained), 2)                        AS avg_delay_gained_minutes,
+  ROUND(PERCENTILE_APPROX(c.delay_gained, 0.5), 1)     AS median_delay_gained_minutes,
+  ROUND(PERCENTILE_APPROX(c.delay_gained, 0.9), 1)     AS p90_delay_gained_minutes,
+  ROUND(AVG(c.delay_at_from), 1)                       AS avg_delay_at_from,
+  ROUND(AVG(c.delay_at_to), 1)                         AS avg_delay_at_to,
+  ROUND(AVG(c.planned_minutes), 1)                     AS avg_planned_minutes,
+  SUM(IF(c.delay_gained > 0, 1, 0))                    AS trips_losing_time,
+  SUM(IF(c.delay_gained < 0, 1, 0))                    AS trips_recovering_time,
+  f.latitude AS from_latitude, f.longitude AS from_longitude,
+  t.latitude AS to_latitude,   t.longitude AS to_longitude
+FROM consecutive c
+LEFT JOIN railway.gold.station f ON f.station_name = c.from_station
+LEFT JOIN railway.gold.station t ON t.station_name = c.to_station
+WHERE c.from_station IS NOT NULL
+  AND c.delay_gained IS NOT NULL      -- NULL means a time was never reported
+  AND NOT c.either_cancelled          -- a cancelled stop has no delay to attribute
+GROUP BY c.from_station, c.to_station, c.hops,
+         f.latitude, f.longitude, t.latitude, t.longitude
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # station_pair_performance — "how late will I be from A to B?"
+# MAGIC
+# MAGIC **Grain: one row per (from_station, to_station).** Direct trains only: the self-join
+# MAGIC requires the same `trip_id`, so a connection is never counted as one journey.
+# MAGIC
+# MAGIC Unlike `segment_performance` this is not restricted to adjacent stops — any A before
+# MAGIC B on the same trip qualifies, which is what a traveller actually asks about.
+# MAGIC
+# MAGIC `trips` is on every row on purpose: with ~1 week of data many pairs have single-digit
+# MAGIC samples, and a P90 over 3 trains is noise wearing a statistic's clothes.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE TABLE railway.gold.station_pair_performance AS
+WITH journeys AS (
+  SELECT
+    a.station_name AS from_station,
+    b.station_name AS to_station,
+    a.train_category, a.train_number, a.service_date,
+    a.departure_delay_minutes AS departure_delay_at_from,
+    b.arrival_delay_minutes   AS arrival_delay_at_to,
+    b.arrival_delay_minutes - a.departure_delay_minutes AS delay_gained,
+    (UNIX_TIMESTAMP(b.planned_arrival_at) - UNIX_TIMESTAMP(a.planned_departure_at)) / 60
+      AS planned_journey_minutes,
+    b.stop_index - a.stop_index AS stops_between,
+    COALESCE(a.is_cancelled, FALSE) OR COALESCE(b.is_cancelled, FALSE) AS either_cancelled
+  FROM railway.gold.route_station_performance a
+  JOIN railway.gold.route_station_performance b
+    ON  a.trip_id = b.trip_id
+    AND a.start_at = b.start_at
+    AND a.stop_index < b.stop_index      -- direction matters; A must precede B
+  WHERE a.is_long_distance AND b.is_long_distance
+)
+SELECT
+  from_station, to_station,
+  COUNT(*)                                                    AS direct_trains,
+  COUNT(DISTINCT service_date)                                AS days_observed,
+  ROUND(AVG(planned_journey_minutes), 0)                      AS avg_planned_journey_minutes,
+  ROUND(AVG(arrival_delay_at_to), 1)                          AS avg_arrival_delay_minutes,
+  ROUND(PERCENTILE_APPROX(arrival_delay_at_to, 0.5), 1)       AS median_arrival_delay_minutes,
+  ROUND(PERCENTILE_APPROX(arrival_delay_at_to, 0.9), 1)       AS p90_arrival_delay_minutes,
+  ROUND(PERCENTILE_APPROX(arrival_delay_at_to, 0.95), 1)      AS p95_arrival_delay_minutes,
+  ROUND(AVG(delay_gained), 1)                                 AS avg_delay_gained_minutes,
+  ROUND(100.0 * SUM(IF(arrival_delay_at_to <= 5, 1, 0)) / COUNT(*), 1)  AS pct_within_5_min,
+  ROUND(100.0 * SUM(IF(arrival_delay_at_to > 15, 1, 0)) / COUNT(*), 1)  AS pct_over_15_min,
+  ROUND(AVG(stops_between), 1)                                AS avg_stops_between,
+  COUNT(DISTINCT train_number)                                AS distinct_services
+FROM journeys
+WHERE arrival_delay_at_to IS NOT NULL
+  AND departure_delay_at_from IS NOT NULL
+  AND NOT either_cancelled
+GROUP BY from_station, to_station
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Checks — run these, do not skip them
+# MAGIC
+# MAGIC `still_circular = 0` is the assertion that catches the "München Hbf -> München Hbf"
+# MAGIC bug. A one-element route is missing data, not a journey from a station to itself.
+
+# COMMAND ----------
+
+display(spark.sql("""
+SELECT
+  SUM(IF(origin IS NULL, 1, 0))                                     AS null_origin,
+  SUM(IF(origin IS NOT NULL AND origin = destination, 1, 0))        AS still_circular,
+  ROUND(100.0*SUM(IF(origin IS NOT NULL,1,0))/COUNT(*), 1)          AS pct_with_route,
+  ROUND(100.0*SUM(IF(is_long_distance AND origin IS NOT NULL,1,0))
+        / NULLIF(SUM(IF(is_long_distance,1,0)),0), 1)               AS pct_with_route_long_distance
+FROM railway.gold.route_station_performance
+"""))
+
+# COMMAND ----------
+
+display(spark.sql("""
+SELECT from_station, to_station, trips,
+       avg_delay_gained_minutes, avg_planned_minutes
+FROM railway.gold.segment_performance
+WHERE hops = 1 AND trips >= 5
+ORDER BY avg_delay_gained_minutes DESC LIMIT 15
+"""))
+
+# COMMAND ----------
+
+display(spark.sql("""
+SELECT from_station, to_station, direct_trains, avg_arrival_delay_minutes,
+       median_arrival_delay_minutes, p90_arrival_delay_minutes,
+       pct_within_5_min, avg_planned_journey_minutes
+FROM railway.gold.station_pair_performance
+WHERE direct_trains >= 5
+ORDER BY direct_trains DESC LIMIT 15
+"""))
