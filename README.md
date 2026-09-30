@@ -6,7 +6,7 @@ Hourly collection of German long-distance rail stop changes (delays, platform ch
 
 **Built:** the ingestion service (DB APIs to Kafka), the bridge (Kafka to a Unity Catalog volume) and three Databricks notebooks (Bronze, Silver, Gold). The two Python services are covered by 103 offline tests. The notebooks have no automated tests; their comments record row counts from runs on collected data.
 
-**Not in this repository:** published delay or punctuality results, a dashboard, a Databricks job definition, CI, and a licence file. The real hourly suppression rate and the daily message volume have not been measured.
+**Not in this repository:** published delay or punctuality results, a dashboard, a Databricks job definition. The real hourly suppression rate and the daily message volume have not been measured.
 
 Last verified: 2026-09-30 (test suite and linter only; no live API, Kafka or Databricks call was re-run for this check).
 
@@ -73,8 +73,6 @@ flowchart LR
 ```
 
 ## How it works
-
-There is no `docs/` directory; the module and notebook docstrings hold the detail.
 
 1. **Station scope (one-off).** `scripts/fetch_stada.py` caches station master data. `scripts/pick_poll_targets.py` reads the route paths of real long-distance trains, resolves the most frequent station names to EVA numbers and keeps those that answer with long-distance traffic.
 2. **Poll and join.** For each station, [db_timetables.py](src/railway_network_analytics/db_timetables.py) fetches `fchg/{eva}` (all known changes, rolling window of about 28 hours) and joins it on the stop id to `plan/{eva}/{date}/{hour}`, the only endpoint that carries train identity. Plan hours from 9 hours back to 8 hours ahead are cached on disk; only the current and next hour are refetched.
@@ -282,11 +280,23 @@ data/, certs/                 local data, state and the Kafka CA certificate; gi
 4. The Gold checks will become assertions that fail the notebook.
 5. A CI workflow will run `pytest` and `ruff`.
 6. The notebooks will get a job definition so that Bronze, Silver and Gold run on a schedule.
-7. A dashboard will be built on the Gold tables, with the OpenStreetMap attribution.
+7. A dashboard will be built on the Gold tables, with the Deutsche Bahn and OpenStreetMap attributions.
 8. DB message codes will be decoded into readable causes.
 
 ## Data sources, attribution and licence
 
-- **Deutsche Bahn Timetables API and StaDa API**, obtained through the [DB API Marketplace](https://developers.deutschebahn.com). Check the terms of each API there before redistributing data.
+This project uses two datasets from the [DB API Marketplace](https://developers.deutschebahn.com). Versions, licences and terms are those shown on the marketplace listings on 2026-09-30.
+
+| Dataset | Version | Provider | Licence | Used for |
+|---|---|---|---|---|
+| Timetables | 1.0.274 | Deutsche Bahn AG (DB Station&Service AG) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | planned stops and changes, polled hourly |
+| StaDa - Station Data | 2.11.702 | Deutsche Bahn AG | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | station names, EVA numbers and coordinates, fetched once |
+
+Attribution: contains data from the Timetables API and the StaDa - Station Data API, © Deutsche Bahn AG, licensed under CC BY 4.0.
+
+- **Changes made.** The data is parsed, filtered to long-distance traffic at 60 stations, joined, and aggregated into derived tables. Deutsche Bahn does not endorse this project or its results, and gives no warranty for the completeness or correctness of the data.
+- **Terms that affect how you run this project.** Request your own API key; a key is for one application and must not be shared. The StaDa terms allow at most one call per key per day, so run `scripts/fetch_stada.py` no more than once a day. The Timetables API is listed as a beta service.
+- **Redistribution.** Anything built on the Bronze, Silver or Gold tables, including a dashboard, must carry the attribution line above.
+
 - **Track geometry** from [OpenRailRouting](https://routing.openrailrouting.org), which routes on OpenStreetMap railway tracks. Data (c) OpenStreetMap contributors, ODbL. The coordinates of the two Basel stations also come from OpenStreetMap.
-- **Licence.** This repository contains no licence file.
+
