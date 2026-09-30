@@ -1,368 +1,292 @@
 # railway-network-analytics
 
-Collects German long-distance rail punctuality data from the Deutsche Bahn APIs and
-streams it into Kafka, for later analysis of how delays develop across the network.
+Hourly collection of German long-distance rail stop changes (delays, platform changes, cancellations) from the Deutsche Bahn Timetables API into Kafka, then into Databricks Delta tables (Bronze, Silver, Gold). Stack: Python 3.14, kafka-python, Databricks SDK, PySpark notebooks, Docker Compose.
 
-**Status: ingestion → Kafka works. Databricks and the Bronze/Silver/Gold layers are not built.**
+## Status
 
----
+**Built:** the ingestion service (DB APIs to Kafka), the bridge (Kafka to a Unity Catalog volume) and three Databricks notebooks (Bronze, Silver, Gold). The two Python services are covered by 103 offline tests. The notebooks have no automated tests; their comments record row counts from runs on collected data.
 
-## 1. What it does
+**Not in this repository:** published delay or punctuality results, a dashboard, a Databricks job definition, CI, and a licence file. The real hourly suppression rate and the daily message volume have not been measured.
 
-Every hour, for ~60 major stations:
+Last verified: 2026-09-30 (test suite and linter only; no live API, Kafka or Databricks call was re-run for this check).
 
-- pulls the **planned** timetable and the **current changes** from DB's Timetables API
-- joins them, so each change carries its train's identity (`ICE 837`), planned times and route
-- drops anything identical to the previous cycle
-- publishes the rest to Kafka, one message per observed stop
+```bash
+uv sync
+uv run pytest
+```
 
-The result is a durable, replayable log of *what changed, when* — delays, platform
-changes, cancelled stops — keyed so a train's history can be reconstructed.
+## Key facts
 
-## 2. Architecture
+| Fact | Value | Context and source |
+|---|---|---|
+| Stations polled | 60 | Default of `scripts/pick_poll_targets.py`, selected from 5,408 StaDa stations (snapshot fetched 2026-09-10). |
+| API cost, warm cache | 180 requests per hourly cycle | Computed: 60 stations x (2 `plan` + 1 `fchg`). This is 5 % of the 60 requests/minute free plan. |
+| API cost, cold cache | 1,140 requests, about 20 minutes | Computed: 60 x (18 `plan` + 1 `fchg`) at 1.1 s spacing (`db_timetables.py`). |
+| Offline tests | 103 passing | `pytest` collection and run on 2026-09-30. |
+| Compression | about 14x on Kafka batches, 11.8x on bridge files | Author's measurements recorded in code comments (commits of 2026-09-10 and 2026-09-15), not reproduced for this README. |
+| Silver table size | 106,917 rows | Historical: recorded in a Silver notebook comment committed 2026-09-15, when the Gold notebook described the dataset as about 1 week of data. |
+
+## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph src["Data sources"]
-    TT["DB Timetables API<br/>60 req/min free"]
-    SD["DB StaDa API<br/>5,408 stations"]
+  subgraph sources["Deutsche Bahn API Marketplace"]
+    TT["Timetables API<br/>plan + fchg, XML"]
+    SD["StaDa API<br/>station master data, JSON"]
   end
 
-  subgraph oneoff["One-off setup (scripts/)"]
-    PT["poll_targets.json<br/>60 verified station EVAs"]
+  subgraph setup["One-off scripts"]
+    PT["poll_targets.json<br/>60 stations"]
   end
 
-  subgraph svc["Ingestion service (Docker, hourly)"]
-    PC["PlanCache<br/>disk, immutable hours"]
-    SRC["DbTimetablesSource<br/>fetch → parse → join → scope"]
-    CF["ChangeFilter<br/>disk, content hashes"]
-    SINK["KafkaSink"]
+  subgraph ingest["ingest service (Docker, hourly)"]
+    SRC["DbTimetablesSource<br/>plan cache + join"]
+    CF["ChangeFilter"]
+    KS["KafkaSink"]
   end
 
-  K["Aiven Kafka<br/>railway.db.stop_observations"]
-  DBX["Databricks<br/>Bronze → Silver → Gold"]
+  K[("Kafka topic<br/>railway.db.stop_observations")]
 
-  SD --> PT
-  PT --> SRC
-  TT -- "plan/{eva}/{date}/{hour}" --> PC
-  TT -- "fchg/{eva}" --> SRC
-  PC --> SRC
-  SRC --> CF --> SINK --> K
-  K -.->|not built| DBX
+  subgraph bridge["bridge service (Docker, hourly)"]
+    BR["drain, gzip, upload"]
+  end
+
+  subgraph dbx["Databricks, catalog railway"]
+    LAND["volume raw/landing"]
+    BZ["bronze.stop_observations"]
+    SV["silver.stop_observations"]
+    GD["gold, 8 tables"]
+    REF["volume raw/reference"]
+  end
+
+  ORR["OpenRailRouting<br/>track geometry"]
+  DASH["Dashboard"]
+
+  SD --> PT --> SRC
+  TT --> SRC --> CF --> KS --> K --> BR --> LAND --> BZ --> SV --> GD
+  PT --> REF
+  ORR --> REF --> GD
+  GD -.->|not built| DASH
+
+  classDef planned stroke-dasharray: 5 5
+  class DASH planned
 ```
 
-## 3. Data sources
+## How it works
 
-| | DB Timetables API | DB StaDa API |
+There is no `docs/` directory; the module and notebook docstrings hold the detail.
+
+1. **Station scope (one-off).** `scripts/fetch_stada.py` caches station master data. `scripts/pick_poll_targets.py` reads the route paths of real long-distance trains, resolves the most frequent station names to EVA numbers and keeps those that answer with long-distance traffic.
+2. **Poll and join.** For each station, [db_timetables.py](src/railway_network_analytics/db_timetables.py) fetches `fchg/{eva}` (all known changes, rolling window of about 28 hours) and joins it on the stop id to `plan/{eva}/{date}/{hour}`, the only endpoint that carries train identity. Plan hours from 9 hours back to 8 hours ahead are cached on disk; only the current and next hour are refetched.
+3. **Scope filter.** Stops flagged as regional, S-Bahn or partner traffic are dropped. Stops with no flag are kept, including changes that matched no plan hour.
+4. **Change filter.** [change_filter.py](src/railway_network_analytics/change_filter.py) hashes 10 change fields per stop (blake2b, 8 bytes) and emits only stops whose digest differs from the previous cycle. `observed_at` is excluded from the hash.
+5. **Sink.** `SINK=kafka` publishes one message per stop observation (28 fields, JSON), keyed by `stop_id`, with a `schema_version=1` header. `SINK=jsonl` appends to `observations-YYYY-MM-DD.jsonl` instead.
+6. **Bridge.** [bridge.py](src/railway_network_analytics/bridge.py) drains the topic once an hour, writes gzip JSONL files named by partition and offset range to `/Volumes/railway/raw/landing`, and commits offsets only after the upload succeeded.
+7. **Bronze.** [bronze_stop_observations.py](databricks/bronze/bronze_stop_observations.py) appends the files unchanged to `railway.bronze.stop_observations` with a declared schema, a `_corrupt_record` column and lineage columns. It uses an `availableNow` trigger and a checkpoint.
+8. **Silver.** [silver_stop_observations.py](databricks/silver/silver_stop_observations.py) parses the payload, converts `YYMMDDHHMM` Berlin local time to UTC, computes arrival and departure delay in minutes, flags cancellations, turns route paths into arrays and deduplicates on `(stop_id, observed_at)`. One row is one observation.
+9. **Gold.** [gold_route_performance.py](databricks/gold/gold_route_performance.py) keeps the last observation per stop and overwrites 8 tables: `route_station_performance`, `route_trip_performance`, `route_daily_performance`, `station`, `segment_performance`, `station_pair_performance`, `segment_geometry` and `segment_geometry_points`. `scripts/upload_station_dim.py` and `scripts/fetch_segment_geometry.py` upload the reference files these tables read.
+
+## Design decisions
+
+| Decision | Reason | Evidence |
 |---|---|---|
-| Gives | planned stops, changes, delays, platforms, delay causes | station master data: names, EVA numbers, coordinates, category |
-| Format | XML | JSON |
-| Role | **operational data** — changes constantly | **reference data** — changes ~monthly |
-| Rate limit | **60 req/min** (free tier) | n/a in practice |
-| Pulled | hourly, by the service | **once**, by hand, cached to disk |
+| Poll `fchg` hourly instead of the 2-minute `rchg` feed. | `fchg` reports every known change over about 28 hours, so a missed cycle is recovered by the next one. | 180 requests per cycle is 5 % of the rate budget. Polling 60 stations every 90 s would use 67 % (`pick_poll_targets.py` prints this table). |
+| Cache past plan hours on disk. | Past hours are immutable. | 18 plan requests per station become 2 (`test_cold_cache_fetches_the_whole_window`, `test_warm_cache_refetches_only_the_current_and_next_hour`). |
+| One Kafka message per observed stop, keyed by `stop_id`. | The source is station-centric and only 60 stations are polled, so a trip-shaped message would imply a completeness the data does not have. | `StopObservation` in `db_timetables.py`; 10 tests in `tests/test_kafka_sink.py`. |
+| Replace the change state each cycle instead of merging. | The state file stays bounded to one cycle of keys. | Cost: a stop that reappears unchanged is emitted once more (`test_state_is_replaced_not_merged`). |
+| Build a new Kafka producer for every cycle. | A producer idle for about 59 minutes lost its sender thread without raising. | Incident recorded in `kafka_sink.py`: the service ran 18 hours and published one cycle. |
+| Abort a cycle after 15 consecutive failed requests. | A process that runs and achieves nothing is never restarted by Docker. | Recorded in `db_timetables.py`: during a 3-day outage each cycle made about 1,140 timed-out requests and took 19 hours. |
+| Push files to Databricks instead of reading Kafka from Spark. | Databricks Free Edition blocks outbound network access. | File names derive from offsets, so a replay overwrites a file instead of duplicating it (`test_name_is_derived_from_offsets_not_the_clock`). |
+| A missing time yields a NULL delay, and cancellations are counted separately. | "No time reported" is not "on time". | Before the `coalesce` fix, `is_cancelled` was NULL for 104,349 of 106,917 Silver rows (notebook comment, commit of 2026-09-15). |
 
-Join key between them is the **EVA number**, never the station name: Timetables says
-`Frankfurt(Main)Hbf`, StaDa says `Frankfurt (Main) Hbf`.
+## Data quality and testing
 
-### Endpoints used
-
-| Endpoint | What it returns | Why |
-|---|---|---|
-| `plan/{eva}/{date}/{hour}` | one station-hour of the **schedule** — `<tl>` train identity, planned times, platform, route | the only place train identity (`ICE 837`) exists |
-| `fchg/{eva}` | **all** currently-known changes for a station, rolling ~28 h window | the change stream |
-| `station/{name}` | name → EVA | one-off, during scope setup |
-
-`rchg` (last ~2 min of changes) is **not** used: it is incompatible with hourly polling.
-
-## 4. Polling strategy
-
-```mermaid
-flowchart TD
-  A["hourly cycle"] --> B{"plan hour<br/>already cached?"}
-  B -->|"past hour (immutable)"| C["reuse cache"]
-  B -->|"current / next hour"| D["fetch plan"]
-  D --> E["cache to disk"]
-  C --> F["fetch fchg (always)"]
-  E --> F
-  F --> G["join on stop id"]
-```
-
-| Data | Cadence | Why |
-|---|---|---|
-| StaDa stations | once, manual | reference data; refetching wastes budget |
-| `poll_targets.json` | once, manual | derived from StaDa + probing |
-| `plan` | ~2 requests/station/cycle | past hours are **immutable** → cached on disk |
-| `fchg` | 1 request/station/cycle | always changing |
-
-**Measured cost:** `60 stations × 3 requests = 180/cycle · 3.3 min · 3 req/min · 5 % of budget · 4,320 req/day of 86,400`.
-A cold cache costs 18 plan requests per station; a warm one costs 2.
-
-**Why hourly is enough:** `fchg` reports the current state of *every* stop of a train,
-so one poll already shows a full delay profile along a route. Hourly gives up watching a
-single estimate move minute-by-minute — that would need `rchg` at ~90 s, costing 68 % of
-the budget instead of 5 %.
-
-**Station scope is derived, not guessed.** StaDa's `category` measures station *size*, not
-long-distance service — category 1 is only 23 stations and excludes Münster, Fulda,
-Bielefeld, Göttingen and Bremen. `scripts/pick_poll_targets.py` instead reads the `ppth`
-route paths of real trains to find which stations Fernverkehr actually serves, resolves
-them to EVAs, and verifies each one answers.
-
-## 5. Change detection
-
-`fchg` returns a rolling 28 h window, so consecutive hourly polls overlap heavily.
-
-| | |
+| Where | What is checked |
 |---|---|
-| **Compared** | `changed_arrival`, `changed_departure`, `changed_platform`, `changed_path`, `messages` |
-| **Ignored** | `observed_at` — our own timestamp changes every cycle and would defeat the filter |
-| **Discarded** | observations whose comparison fields hash identically to last cycle |
-| **Published** | everything else |
-| **State** | `blake2b` digest per `stop_id` in `data/state/seen.json`, **replaced** each cycle |
+| Ingestion | All configuration errors are reported at once (exit code 2). A response whose root tag is not `<timetable>` is treated as a failure, not as "no changes". |
+| Kafka sink | Every record must be confirmed by the broker, otherwise `KafkaDeliveryError` is raised. |
+| Bridge | Offsets are committed only after every partition of a batch is uploaded. Three consecutive empty polls, not one, end a drain. |
+| Bronze | The schema is declared, never inferred. Unparseable lines are kept in `_corrupt_record`. |
+| Silver | Duplicates on `(stop_id, observed_at)` are dropped within a 2-day watermark. |
+| Gold | Notebook cells display a grain check, an observation-collapse check, a NULL-preservation check and a `still_circular` count. They are displayed, not enforced: a failing check does not stop the notebook. |
 
-State is persisted because an hourly run is cron-shaped and does not survive between
-cycles. It is *replaced* rather than merged, so a stop that leaves the feed is forgotten
-— which bounds the file, at the cost of re-emitting it once if it returns unchanged.
+The test suite has 103 tests, needs no network and no credentials, and ran in about 1 second on 2026-09-30.
 
-**Measured: 96–98 % suppressed** on back-to-back cycles. Real hourly suppression is lower
-and has not yet been measured.
-
-## 6. Kafka
-
-| | Value | Why |
+| File | Tests | Covers |
 |---|---|---|
-| Topic | `railway.db.stop_observations` | |
-| Granularity | one message per observed stop | the source is station-centric; we poll 60 of ~5,400 stations, so a trip-shaped message would claim completeness we don't have |
-| Key | `stop_id` = `{trip_id}-{start_datetime}-{stop_index}` | natural key; high cardinality → even partitions; keeps compaction possible later |
-| Partitions | 2 | the Aiven plan's cap; ample at ~3 msg/s |
-| Retention | **3 days** | 7 was requested and **refused**: `PolicyViolationError` — set in the Aiven console, not via Kafka |
-| Cleanup | `delete` | `compact` keeps only the latest message per key, destroying the delay history |
-| Compression | `gzip` | ~14× measured; only codec needing no extra dependency |
-| Acks | `all` + idempotence | but `min.insync.replicas=1`, so today this is no stronger than `acks=1` |
-| Delivery | at-least-once | downstream must be idempotent |
-
-Observed balance across partitions: **1450 / 1375**. With only 6 distinct keys the split
-was 5:1 — hashing gives determinism, cardinality gives balance.
-
-## Data lineage
-
-A real record collected on 2026-09-10: **ICE 837 at Frankfurt(Main)Hbf** — delayed,
-moved platform, and dropped a stop.
-
-```mermaid
-flowchart TD
-  P["plan XML<br/>identity + schedule"] --> J
-  F["fchg XML<br/>the change"] --> J
-  J["join on stop id"] --> N["StopObservation"]
-  N --> C{"digest differs<br/>from last cycle?"}
-  C -->|no| X["discarded"]
-  C -->|yes| K["Kafka message"]
-  K -.->|not built| B["Bronze"] -.-> S["Silver"] -.-> G["Gold"]
-```
-
-**1 — `plan` XML** (the schedule; identity lives only here)
-
-```xml
-<s id="-6921696305208670614-2609100856-6">
-  <tl f="F" t="p" o="80" c="ICE" n="837"/>
-  <ar pt="2609101256" pp="11" fb="ICE 837"
-      ppth="Berlin Gesundbrunnen|Berlin Hbf|Berlin Südkreuz|Halle(Saale)Hbf|Erfurt Hbf"/>
-</s>
-```
-
-**2 — `fchg` XML** (the change; a sparse delta — note it carries no `<tl>`, so it cannot
-identify the train on its own)
-
-```xml
-<s id="-6921696305208670614-2609100856-6" eva="8000105">
-  <ar ct="2609101329" cp="12"
-      cpth="Berlin Hbf|Berlin Südkreuz|Halle(Saale)Hbf|Erfurt Hbf"/>
-  <m t="d" c="51"/>
-  <m t="h" cat="Information"/>
-</s>
-```
-
-**3 — `StopObservation`** (joined on the stop id; `observed_at` is ours, everything else
-is the source's, unmodified)
-
-```json
-{
-  "stop_id": "-6921696305208670614-2609100856-6",
-  "station_eva": 8000105, "station_name": "Frankfurt(Main)Hbf",
-  "trip_id": "-6921696305208670614", "start_datetime": "2609100856", "stop_index": 6,
-  "train_category": "ICE", "train_number": "837",
-  "train_operator": "80", "train_filter": "F",
-  "planned_arrival": "2609101256", "changed_arrival": "2609101329",
-  "planned_platform": "11",        "changed_platform": "12",
-  "planned_path": "Berlin Gesundbrunnen|Berlin Hbf|Berlin Südkreuz|Halle(Saale)Hbf|Erfurt Hbf",
-  "changed_path": "Berlin Hbf|Berlin Südkreuz|Halle(Saale)Hbf|Erfurt Hbf",
-  "messages": [["d", "51", null], ["h", null, "Information"]],
-  "observed_at": "2026-09-10T13:15:00+02:00"
-}
-```
-
-Three facts are now visible that the raw XML only implied: **+33 min** (12:56 → 13:29),
-**platform 11 → 12**, and **Berlin Gesundbrunnen dropped from the route**.
-
-**4 — change detection** (hash the comparison fields only)
-
-```
-payload  ("2609101329", null, "12", "Berlin Hbf|...", [["d","51",null]])
-digest   e0d91da45e9b7649
-
-cycle N     e0d91da45e9b7649   first sight        → published
-cycle N+1   e0d91da45e9b7649   identical          → discarded
-cycle N+2   7ac5d0e493eae024   delay grew to +39m → published
-```
-
-**5 — Kafka message**
-
-```
-topic    railway.db.stop_observations
-key      -6921696305208670614-2609100856-6
-headers  schema_version=1
-value    <the StopObservation JSON above>
-```
-
-**6 — Bronze / Silver / Gold** — *not built.* Planned shape:
-
-| Layer | Would do |
-|---|---|
-| Bronze | append raw messages unchanged, preserving replayability |
-| Silver | parse `YYMMDDHHMM` → timestamps, compute `delay = changed − planned`, deduplicate on `stop_id`, decode message codes (`d/51`), classify operator |
-| Gold | delay by station, route punctuality, cancelled-stop rates, delay propagation |
-
-## 7. Status
-
-### Implemented and verified
-
-- StaDa fetch + cache; station scope derived from real route data and probe-verified
-- `plan` + `fchg` fetch, XML parse, join on stop id, disk-backed plan cache
-- Scope filtering, change detection with persistent state
-- JSONL sink and Kafka sink (`SINK=jsonl|kafka`)
-- Dockerised, non-root, no secrets in the image; `SIGTERM` handled
-- **77 offline tests**, ruff clean
-- End-to-end verified: DB APIs → Docker → Aiven Kafka → consumer
-
-### Planned next
-
-- Measure real hourly suppression and daily volume over several hours
-- Databricks connection, consuming from Kafka
-- Bronze, then Silver, then Gold
-
-### Future ideas
-
-- Decode DB message codes into human-readable causes
-- Widen station scope (budget allows ~4× more)
-- Schema registry, if a second producer ever appears
-- Backfill / replay tooling
-
----
-
-## Running it
-
-Requires [uv](https://docs.astral.sh/uv/), Python 3.14, and free DB API credentials from
-[developers.deutschebahn.com](https://developers.deutschebahn.com).
+| `tests/test_db_timetables.py` | 30 | XML parsing, join, plan cache, scope filter, cancellations, outage abort |
+| `tests/test_config.py` | 18 | defaults, validation, Kafka requirements |
+| `tests/test_bridge.py` | 16 | record format, file naming, upload-then-commit, drain and shutdown |
+| `tests/test_service.py` | 15 | poll loop, suppression, JSONL sink, logging |
+| `tests/test_kafka_sink.py` | 10 | key, value, header, delivery confirmation, producer lifecycle |
+| `tests/test_change_filter.py` | 8 | digest stability, state persistence, atomic save |
+| `tests/test_main.py` | 6 | exit codes, secret redaction |
 
 ```bash
-uv sync && cp .env.example .env      # then fill in the credentials
+uv run pytest
+uv run ruff check .
 ```
 
-One-off scope setup (~5 min of rate-limited requests):
+There is no CI workflow. The notebooks and the scripts have no tests.
+
+## Quick start
+
+Prerequisites:
+
+- Python 3.14 and [uv](https://docs.astral.sh/uv/) (checked with uv 0.12.10; the build backend is pinned to `uv_build>=0.12.10,<0.13.0`).
+- Timetables and StaDa credentials from [developers.deutschebahn.com](https://developers.deutschebahn.com).
+- For Kafka: a cluster reachable with SASL_SSL and SCRAM-SHA-256, and its CA certificate saved as `certs/ca.pem`.
+- For the bridge and notebooks: a Databricks workspace with a `railway` catalog, a `raw` schema and the volumes `landing` and `reference`. The notebooks create the other schemas and the `checkpoints` volume.
+- Docker with Compose for the two-service deployment.
+
+Install and run the tests (no credentials needed). Expected output: `103 passed` and `All checks passed!`.
 
 ```bash
-set -a; source .env; set +a; uv run python scripts/fetch_stada.py && uv run python scripts/pick_poll_targets.py
+uv sync
+uv run pytest
+uv run ruff check .
 ```
 
-One cycle to a local file:
+Create the environment file, then fill in the credentials. The application does not load `.env` itself, so each command below exports it first.
+
+```bash
+cp .env.example .env
+```
+
+Build the station scope once. The second script makes roughly 250 rate-limited requests in about 5 minutes and should run during the day. Pass a number, for example `5`, to select fewer stations than the default 60.
+
+```bash
+set -a; source .env; set +a; uv run python scripts/fetch_stada.py
+set -a; source .env; set +a; uv run python scripts/pick_poll_targets.py
+```
+
+Run one cycle to a local file. With 60 stations and a cold cache this takes about 20 minutes. The log shows `poll targets loaded`, `using jsonl sink`, `poll ok` with the cycle counters and `max_polls reached`, and the records land in `data/out/observations-YYYY-MM-DD.jsonl` (UTC date).
 
 ```bash
 set -a; source .env; set +a; MAX_POLLS=1 uv run python -m railway_network_analytics
 ```
 
-One cycle to Kafka:
+Create the topic, then run one cycle to Kafka.
 
 ```bash
+set -a; source .env; set +a; uv run python scripts/kafka_create_topic.py
 set -a; source .env; set +a; SINK=kafka MAX_POLLS=1 uv run python -m railway_network_analytics
 ```
 
-Docker — `STATE_DIR` must be a volume, since the plan cache and change state must
-survive between cycles:
+Run both services continuously. Add `DATABRICKS_HOST` and `DATABRICKS_TOKEN` to `.env` first; they are not in `.env.example`. The image build copies `data/raw/stada/poll_targets.json`, which is gitignored, so the scope step above must have run.
 
 ```bash
-docker build -t railway-ingest:0.2 . && docker run --rm -e TIMETABLES_CLIENT_ID -e TIMETABLES_API_KEY -e MAX_POLLS=1 -v rna-state:/app/data/state -v rna-out:/app/data/out railway-ingest:0.2
+set -a; source .env; set +a; docker compose up -d --build
+docker compose logs -f
 ```
 
-Tests:
+On Databricks, import the three files under `databricks/` as notebooks and run Bronze, then Silver, then Gold. Before Gold, upload the station dimension. The last two Gold tables need the geometry file, which the geometry script can only build once `gold.segment_performance` exists.
 
 ```bash
-uv run pytest ; uv run ruff check .
+set -a; source .env; set +a; uv run python scripts/upload_station_dim.py
+set -a; source .env; set +a; uv run python scripts/fetch_segment_geometry.py
 ```
 
 ## Configuration
 
-Environment variables, read once at startup and validated together. Invalid config exits
-`2` listing every problem. Secrets are redacted from logs by field name.
+Ingestion service (`config.py`). An empty value is treated as unset.
 
-| Variable | Default | |
+| Variable | Default | Notes |
 |---|---|---|
-| `TIMETABLES_CLIENT_ID` / `_API_KEY` | — | required; the key is **secret** |
-| `STATION_DATA_CLIENT_ID` / `_API_KEY` | — | only for `scripts/fetch_stada.py` |
-| `POLL_TARGETS_PATH` | `data/raw/stada/poll_targets.json` | must exist |
-| `STATE_DIR` | `data/state` | plan cache + change state; **must persist** |
-| `OUTPUT_DIR` | `data/out` | checked writable at startup |
-| `POLL_INTERVAL_SECONDS` | `3600` | fixed-rate, not fixed-delay |
-| `MAX_POLLS` | `0` | `0` = run until stopped |
-| `SINK` | `jsonl` | or `kafka` |
-| `KAFKA_*` | — | required only when `SINK=kafka` |
-| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `json` in the container |
+| `TIMETABLES_CLIENT_ID`, `TIMETABLES_API_KEY` | none | Required. |
+| `POLL_TARGETS_PATH` | `data/raw/stada/poll_targets.json` | Must exist. |
+| `STATE_DIR` | `data/state` | Plan cache and change state. Must persist between runs. |
+| `OUTPUT_DIR` | `data/out` | JSONL sink only; checked writable at startup. |
+| `POLL_INTERVAL_SECONDS` | `3600` | Fixed rate, not fixed delay. |
+| `MAX_POLLS` | `0` | `0` runs until stopped. |
+| `SINK` | `jsonl` | `jsonl` or `kafka`. |
+| `KAFKA_TOPIC` | `railway.db.stop_observations` | Also read by the bridge. |
+| `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_USERNAME`, `KAFKA_PASSWORD` | none | Required when `SINK=kafka`, and by the bridge. |
+| `KAFKA_CA_CERT` | `certs/ca.pem` | Must exist when `SINK=kafka`. |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
+| `LOG_FORMAT` | `text` | `text` or `json`. The Docker image sets `json`. |
+| `HTTP_TIMEOUT_SECONDS` | `60` | Validated but not used: the HTTP client has a fixed 20 s timeout. |
 
-Exit codes: `0` clean · `2` bad config · `3` poll targets missing/empty · `4` output not writable.
+Bridge (`bridge.py`) and scripts.
 
-## Known limitations
+| Variable | Default | Notes |
+|---|---|---|
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | none | Required by the bridge and the Databricks scripts. |
+| `DATABRICKS_VOLUME` | `/Volumes/railway/raw/landing` | Upload target of the bridge. |
+| `BRIDGE_GROUP_ID` | `railway-bridge` | Consumer group. |
+| `BRIDGE_BATCH_SIZE` | `500` | Records per uploaded file. |
+| `BRIDGE_POLL_TIMEOUT_MS` | `10000` | |
+| `BRIDGE_INTERVAL_SECONDS` | `3600` | |
+| `BRIDGE_MAX_BATCHES` | `0` | `0` is unlimited. |
+| `STATION_DATA_CLIENT_ID`, `STATION_DATA_API_KEY` | none | `scripts/fetch_stada.py` only. |
+| `DATABRICKS_REFERENCE_VOLUME` | `/Volumes/railway/raw/reference` | `upload_station_dim.py` and `fetch_segment_geometry.py`. |
+| `DATABRICKS_WAREHOUSE_ID` | the author's warehouse | `fetch_segment_geometry.py`. Set your own. |
 
-**Data source**
+Script arguments: `scripts/pick_poll_targets.py [N]` sets the number of stations (default 60). `scripts/kafka_create_topic.py --cleanup` also deletes three tutorial topics. Docker Compose passes each service only the variables listed in `docker-compose.yml`.
 
-- `f="F"` is a **DB-centric flag, not a mode classifier**. DB sets it only for its own and
-  partner trains, so third-party operators have none — mixing private regional
-  (`NX`, `ARV`, `vlx`) with open-access long-distance (`FLX`, `TRI`) in one unflagged
-  bucket. Silver must classify on category + operator.
-- ~14 % of changes never match a plan hour and stay unidentified. Kept deliberately: they
-  skew towards trains that started long ago, i.e. the worst delays.
-- The canonical EVA is not always the right one — Berlin Hbf's `8011160` returns 0 stops;
-  its long-distance traffic is on `8098160`.
-- Message codes (`d/51`, `cat="Störung"`) are undecoded.
+Exit codes of the ingestion service: `0` clean stop, `2` invalid configuration, `3` poll targets missing or empty, `4` output not writable. The bridge exits `2` when a required variable is missing.
 
-**Pipeline**
-
-- Retention is 3 days, so that is the whole replay window.
-- `acks=all` is nominal while `min.insync.replicas=1`.
-- `flush()` does not surface per-record failures, so the written count is slightly optimistic.
-- At-least-once; no retry backoff (a missed cycle self-heals via `fchg`'s 28 h window).
-
-## Repository layout
+## Project structure
 
 ```
 src/railway_network_analytics/
-  config.py          env → validated Config; the only reader of os.environ
-  db_timetables.py   source adapter: fetch, parse XML, join plan+changes, scope
-  change_filter.py   persistent content-hash filter; source-agnostic
-  sink.py            ObservationSink protocol + JSON Lines writer
-  kafka_sink.py      same protocol, Kafka
-  service.py         poll scheduling and failure policy
-  logging_setup.py   text/JSON formatters
-  __main__.py        entrypoint: config, logging, signals, wiring, exit codes
+  __main__.py        entrypoint (railway-ingest): config, logging, signals, wiring, exit codes
+  config.py          environment to validated Config for the ingestion service
+  db_timetables.py   Timetables adapter: fetch, parse XML, plan cache, join, scope filter
+  change_filter.py   persistent content-hash filter
+  service.py         poll loop and failure policy
+  sink.py            ObservationSink protocol and JSON Lines sink
+  kafka_sink.py      Kafka sink with delivery confirmation
+  bridge.py          entrypoint (railway-bridge): Kafka to Unity Catalog volume
+  logging_setup.py   text and JSON log formatters
+databricks/
+  bronze/bronze_stop_observations.py   landing files to Delta, unchanged
+  silver/silver_stop_observations.py   parsed, typed, deduplicated observations
+  gold/gold_route_performance.py       route, trip, segment and station-pair tables
 scripts/
-  fetch_stada.py            one-off: cache station master data
-  pick_poll_targets.py      one-off: derive + verify the station scope
-  kafka_create_topic.py     create/configure the topic
-  kafka_*.py                tutorial/diagnostic consumers and producers
-  probe_timetables_join.py  diagnostic: inspect the plan/changes join
-  profile_gtfs_rt.py        archived analysis of the retired GTFS.de source
-tests/                      77 tests, offline, no credentials needed
-data/                       source data, state, output — gitignored
+  fetch_stada.py              one-off: cache station master data
+  pick_poll_targets.py        one-off: derive and verify the station scope
+  kafka_create_topic.py       create and configure the topic (2 partitions, replication 2)
+  upload_station_dim.py       upload station coordinates for Gold
+  fetch_segment_geometry.py   fetch track geometry and upload it for Gold
+  databricks_ping.py          diagnostic: volume write and read round trip
+  probe_timetables_join.py    diagnostic: inspect the plan and changes join
+  kafka_ping.py, kafka_consume.py, kafka_consume_group.py, kafka_key_demo.py, kafka_produce_one.py
+                              Kafka tutorial and diagnostic scripts
+  profile_gtfs_rt.py          archived analysis of the retired GTFS.de source
+tests/                        103 offline tests
+Dockerfile, docker-compose.yml   one image, two services (ingest, bridge)
+data/, certs/                 local data, state and the Kafka CA certificate; gitignored
 ```
 
-## Attribution
+## Limitations and known issues
 
-Data from the Deutsche Bahn Timetables and StaDa APIs, © DB InfraGO AG.
+- **A failed publish can lose one cycle of changes.** `service.py` saves the change state before the sink write. If the write then fails, the process stops, and after a restart the unpublished stops are suppressed as already seen.
+- **`HTTP_TIMEOUT_SECONDS` has no effect.** The HTTP client uses a fixed 20 s timeout.
+- **Partial view of each trip.** Only 60 stations are polled, so Gold reports the first and last observed stop, not the true origin and destination. A segment with `hops > 1` spans stations that were never observed.
+- **The `f="F"` flag is set by DB for its own and partner trains only.** Third-party operators carry no flag, so ingestion over-collects and Gold classifies long-distance traffic with a fixed list of train categories.
+- **Some changes stay unidentified.** The plan window identifies about 90 % of changes (code comment, 2026-09-10). The rest are kept without train category or number; `brand` recovers identity for some of them.
+- **Replay window of 3 days.** The Kafka plan refused a 7-day retention (`PolicyViolationError`, recorded in `scripts/kafka_create_topic.py`). A bridge outage longer than that loses data.
+- **`acks=all` is nominal.** The cluster has `min.insync.replicas=1`, so it is no stronger than `acks=1` (`kafka_sink.py`).
+- **No retry within a cycle.** The next hourly cycle is the retry.
+- **Message codes are not decoded.** `messages` is stored as raw `(type, code, category)` triples.
+- **Gold is rebuilt by full overwrite, and its checks are not enforced.** Track geometry is a plausible routed path between two stations, not the path a train took, and is not a basis for distance metrics.
+- **Unmeasured.** The hourly suppression rate and the daily message volume are not recorded anywhere in this repository.
+- **Setup gaps.** `.env.example` lacks the Databricks variables, the Docker build depends on a gitignored file, and there is no Databricks job definition, CI workflow or licence file.
+
+## Roadmap
+
+1. The change state will be saved only after a confirmed sink write.
+2. The hourly suppression rate and the daily message volume will be measured over several days and recorded here.
+3. `HTTP_TIMEOUT_SECONDS` will be wired to the HTTP client or removed.
+4. The Gold checks will become assertions that fail the notebook.
+5. A CI workflow will run `pytest` and `ruff`.
+6. The notebooks will get a job definition so that Bronze, Silver and Gold run on a schedule.
+7. A dashboard will be built on the Gold tables, with the OpenStreetMap attribution.
+8. DB message codes will be decoded into readable causes.
+
+## Data sources, attribution and licence
+
+- **Deutsche Bahn Timetables API and StaDa API**, obtained through the [DB API Marketplace](https://developers.deutschebahn.com). Check the terms of each API there before redistributing data.
+- **Track geometry** from [OpenRailRouting](https://routing.openrailrouting.org), which routes on OpenStreetMap railway tracks. Data (c) OpenStreetMap contributors, ODbL. The coordinates of the two Basel stations also come from OpenStreetMap.
+- **Licence.** This repository contains no licence file.

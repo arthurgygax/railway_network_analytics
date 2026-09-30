@@ -528,3 +528,89 @@ FROM railway.gold.station_pair_performance
 WHERE direct_trains >= 5
 ORDER BY direct_trains DESC LIMIT 15
 """))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # segment_geometry — real track paths for the map
+# MAGIC
+# MAGIC Straight lines between stations are wrong in a way that shows: Köln -> Frankfurt
+# MAGIC Flughafen drawn straight is 152 km across the Westerwald, while the actual
+# MAGIC Köln-Rhein/Main high-speed line is 168 km via Montabaur.
+# MAGIC
+# MAGIC Geometry from **OpenRailRouting** (GraphHopper on OSM railway tracks), fetched by
+# MAGIC `scripts/fetch_segment_geometry.py`. Data (c) OpenStreetMap contributors, ODbL —
+# MAGIC **the dashboard must show that attribution.**
+# MAGIC
+# MAGIC Caveat worth stating on the map: this is *a* plausible rail path between two
+# MAGIC stations, not provably the path that train took. Where two corridors exist
+# MAGIC (Köln->Dortmund via Düsseldorf or via Wuppertal) the router picks one. Good enough
+# MAGIC to draw; not a basis for distance metrics.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE TABLE railway.gold.segment_geometry AS
+SELECT
+  g.from_station,
+  g.to_station,
+  g.track_km,
+  SIZE(g.coordinates) AS geometry_points,
+  g.coordinates,                      -- [[lon, lat], ...] for pydeck / custom viz
+  s.hops,
+  s.trips,
+  s.avg_delay_gained_minutes,
+  s.median_delay_gained_minutes,
+  s.trips_losing_time,
+  s.trips_recovering_time
+FROM json.`/Volumes/railway/raw/reference/segment_geometry.jsonl` g
+JOIN railway.gold.segment_performance s
+  ON s.from_station = g.from_station AND s.to_station = g.to_station AND s.hops = 1
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Exploded form for the AI/BI map
+# MAGIC
+# MAGIC Databricks AI/BI map visuals draw **markers and choropleths, not polylines**. So the
+# MAGIC geometry is also published as points: downsampled to roughly 60 per segment, which
+# MAGIC reads as a line at country zoom without shipping 240,000 markers.
+# MAGIC
+# MAGIC Use `segment_geometry` (full arrays) for a notebook pydeck map if you want true
+# MAGIC polylines; use this table for the dashboard.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE TABLE railway.gold.segment_geometry_points AS
+WITH sampled AS (
+  SELECT
+    from_station, to_station, track_km, trips,
+    avg_delay_gained_minutes, trips_losing_time, trips_recovering_time,
+    FILTER(
+      coordinates,
+      (point, i) -> i % GREATEST(1, CAST(SIZE(coordinates) / 60 AS INT)) = 0
+    ) AS points
+  FROM railway.gold.segment_geometry
+)
+SELECT
+  from_station, to_station, track_km, trips,
+  avg_delay_gained_minutes, trips_losing_time, trips_recovering_time,
+  from_station || ' -> ' || to_station AS segment,
+  point[1] AS latitude,
+  point[0] AS longitude,
+  position   AS point_index
+FROM sampled
+LATERAL VIEW POSEXPLODE(points) AS position, point
+""")
+
+# COMMAND ----------
+
+display(spark.sql("""
+SELECT
+  (SELECT COUNT(*) FROM railway.gold.segment_geometry)        AS segments_with_geometry,
+  (SELECT COUNT(*) FROM railway.gold.segment_geometry_points) AS map_points,
+  (SELECT ROUND(AVG(geometry_points),0) FROM railway.gold.segment_geometry) AS avg_raw_points,
+  (SELECT ROUND(SUM(track_km),0) FROM railway.gold.segment_geometry)        AS total_track_km
+"""))
